@@ -1,20 +1,15 @@
 import { randomUUID } from 'node:crypto';
-import { realpath } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import { classify, containsLikelySecret, fingerprint, resolvedPaths, sensitivePath, stableJson } from './policy.mjs';
-import { markdownText, RULES, validateChinese } from './rules.mjs';
+import { markdownText, rulesFor, validateChinese } from './rules.mjs';
 import { MemoryStore } from './store.mjs';
+import { assessRoutine, canonicalPath, searchProject, within } from './routine.mjs';
 
 const PLAN_TTL = 5 * 60_000;
 const APPROVE = '仅允许这一次';
 const PACKAGE_DIR = fileURLToPath(new URL('../', import.meta.url));
-
-function within(candidate, root) {
-  const relative = path.relative(root, candidate);
-  return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
-}
 
 function toolString(name, description, parameters, execute) {
   return { name, description, parameters, output: {
@@ -29,13 +24,15 @@ function memoryText(items) {
 }
 
 export async function install(ctx, config, defineTool) {
-  const unknown = Object.keys(config).filter(key => key !== 'dataDir');
+  const unknown = Object.keys(config).filter(key => !['dataDir', 'mode'].includes(key));
   if (unknown.length) throw new Error(`不支持的配置：${unknown.join(', ')}`);
+  const mode = config.mode ?? 'balanced';
+  if (!['balanced', 'strict'].includes(mode)) throw new Error('mode 只支持 balanced 或 strict。');
   const dataDir = config.dataDir ?? path.join(process.env.LOCALAPPDATA ?? path.join(homedir(), '.local', 'share'), 'DSH-Memory-Guard');
   const store = await new MemoryStore(dataDir).init();
   const plans = new WeakMap();
   const recent = new WeakMap();
-  const passed = new Set();
+  const passed = new Map();
   const definitions = new Map();
   let disposed = false;
 
@@ -80,7 +77,7 @@ export async function install(ctx, config, defineTool) {
   };
 
   ctx.effect(() => () => { disposed = true; passed.clear(); });
-  ctx.systemPrompt.section({ name: 'memory-guard:rules', order: 850, interpolate: false, text: RULES });
+  ctx.systemPrompt.section({ name: 'memory-guard:rules', order: 850, interpolate: false, text: rulesFor(mode) });
   ctx.systemPrompt.section({ name: 'memory-guard:memory', order: 851, interpolate: false,
     text: ({ agent }) => {
       if (!agent) return '';
@@ -90,7 +87,7 @@ export async function install(ctx, config, defineTool) {
   });
 
   register(toolString('guard_plan',
-    '执行非查看工具前，登记准确的工具名和完整原始参数。先用普通中文向用户说明目标、原因和影响；登记不等于获得授权。',
+    '仅在操作需要额外确认时登记完整工具名、原始参数和中文影响说明。项目内常规操作不必重复登记；登记不等于获得授权。',
     {
       tool_name: { type: 'string', required: true, description: '接下来要调用的完整工具名。' },
       arguments_json: { type: 'string', required: true, description: '接下来那次调用的完整参数，JSON 对象字符串，必须逐项一致。' },
@@ -117,6 +114,14 @@ export async function install(ctx, config, defineTool) {
 
   register(toolString('guard_memory_list', '查看用户已确认保存的全局和当前项目记忆。', {},
     async (_args, exec) => memoryText(store.list(scopeOf(exec.agent)))));
+
+  register(toolString('guard_search', '在当前项目中搜索普通文本，无须确认。使用字面量搜索，自动跳过敏感文件、隐藏目录、依赖、生成目录和本地链接；返回最多 200 条匹配。优先使用它进行项目内容搜索。',
+    { query: { type: 'string', required: true, description: '要查找的单行原文，区分大小写，不是正则表达式。' },
+      path: { type: 'string', description: '可选的项目内文件或目录；默认当前项目。' } },
+    async (args, exec) => {
+      if (containsLikelySecret(args.query)) throw new Error('搜索内容疑似包含凭据，请改用不暴露凭据的关键词。');
+      return searchProject(args.query, args.path, scopeOf(exec.agent), [store.directory, PACKAGE_DIR], exec.signal);
+    }));
 
   register(toolString('guard_memory_propose', '仅当用户明确要求记住时提出一条长期记忆。保存原文前必须由真人确认，不能保存凭据或一次性授权。',
     { text: { type: 'string', required: true, description: '希望保存的稳定偏好、约定或事实，最多 1200 字符。' },
@@ -149,27 +154,33 @@ export async function install(ctx, config, defineTool) {
       return { kind: 'deny', reason: '请由用户在扩展管理界面操作插件；模型不能更改或停用自己的保护。' };
     }
     const own = policy.kind === 'internal' && ctx.tools.get(exec.name, exec.agent) === definitions.get(exec.name);
-    if (policy.kind === 'read' || policy.kind === 'interaction' || own) {
-      // Resolve local aliases without opening file contents.
-      if (!exec.agent) return { kind: 'deny', reason: '缺少会话，无法核对文件位置。' };
-      const cwd = scopeOf(exec.agent);
-      for (const target of resolvedPaths(exec.arguments, cwd)) {
-        if (within(target, store.directory)) return { kind: 'deny', reason: '请通过记忆工具查看记忆，不能直接读取存储记录。' };
-        try {
-          const actual = await realpath(target);
-          if (sensitivePath(actual) || within(actual, store.directory)) return { kind: 'deny', reason: '目标指向敏感文件或记忆存储目录。' };
-        } catch (error) { if (!['ENOENT', 'ENOTDIR'].includes(error.code)) return { kind: 'deny', reason: '无法安全核对目标路径。' }; }
-      }
-      if (disposed || exec.signal?.aborted) return { kind: 'deny', reason: '检查期间操作已取消。' };
-      passed.add(exec.token);
+    if (!exec.agent) return { kind: 'deny', reason: '缺少会话，无法核对文件位置。' };
+    const cwd = scopeOf(exec.agent);
+    for (const target of resolvedPaths(exec.arguments, cwd)) {
+      try {
+        const actual = await canonicalPath(target);
+        if (sensitivePath(actual) || within(actual, store.directory)) return { kind: 'deny', reason: '目标指向敏感文件或记忆存储目录。' };
+        if (policy.kind === 'review' && within(actual, await canonicalPath(PACKAGE_DIR))) {
+          return { kind: 'deny', reason: '模型不能修改保护插件；请由用户手动管理。' };
+        }
+      } catch { return { kind: 'deny', reason: '无法安全核对目标路径。' }; }
+    }
+    let routine;
+    if (mode === 'balanced' && policy.kind === 'review') {
+      try { routine = await assessRoutine(ctx, exec, cwd, [store.directory, PACKAGE_DIR]); }
+      catch { /* Unverifiable operations stay on the reviewed path. */ }
+    }
+    if (policy.kind === 'read' || policy.kind === 'interaction' || own || routine) {
+      if (disposed || exec.signal?.aborted || cwd !== scopeOf(exec.agent)) return { kind: 'deny', reason: '检查期间操作已取消，或当前目录已改变。' };
+      passed.set(exec.token, { scope: cwd, key: fingerprint(exec.name, exec.arguments),
+        ...(routine === 'sandbox' ? { sandbox: ctx.get('sandboxPolicy').resolve({ session: exec.agent.session }) } : {}) });
       return next();
     }
-    if (!exec.agent) return { kind: 'deny', reason: '缺少可向真人确认的会话，已停止执行。' };
     const key = fingerprint(exec.name, exec.arguments);
     const entries = sessionPlans(exec.agent);
     const plan = entries.get(key);
     entries.delete(key); // An attempted use consumes the plan, including a rejection.
-    if (!plan || plan.scope !== scopeOf(exec.agent)) return { kind: 'deny', reason: '尚未说明这一次操作，或参数、目录已改变。先用中文说明目的和影响，再调用 guard_plan 登记完全相同的参数。' };
+    if (!plan || plan.scope !== scopeOf(exec.agent)) return { kind: 'deny', reason: `尚未说明这一次操作，或参数、目录已改变。${exec.name === 'grep' && mode === 'balanced' ? '项目内容搜索请优先使用 guard_search，无须确认。' : ''}超出自动执行范围的操作，先用中文说明目的和影响，再调用 guard_plan 登记完全相同的参数。` };
     const targets = resolvedPaths(exec.arguments, plan.scope);
     if (targets.some(target => within(target, PACKAGE_DIR) || within(target, store.directory))) {
       return { kind: 'deny', reason: '模型不能修改保护插件或记忆记录；请由用户手动管理。' };
@@ -189,12 +200,23 @@ export async function install(ctx, config, defineTool) {
     await store.audit(exec.name, approved ? 'human-approved' : 'denied');
     if (!approved) return { kind: 'deny', reason: '用户未明确同意，或真人确认界面不可用；操作已停止。不要改换工具重试。' };
     if (disposed || exec.signal?.aborted || plan.scope !== scopeOf(exec.agent)) return { kind: 'deny', reason: '确认期间会话或目录已改变，请重新说明并确认。' };
-    passed.add(exec.token);
+    passed.set(exec.token, { scope: plan.scope, key });
     return next();
   });
 
   // A later waterfall listener returning "allow" cannot undo this final denial.
-  ctx.tools.guard(exec => passed.delete(exec.token) ? undefined : '该调用未完成本插件的检查和必要的真人确认，已阻止执行。');
+  ctx.tools.guard(exec => {
+    const permit = passed.get(exec.token);
+    passed.delete(exec.token);
+    if (permit && !disposed && !exec.signal?.aborted && permit.scope === scopeOf(exec.agent)
+        && permit.key === fingerprint(exec.name, exec.arguments)) {
+      if (!permit.sandbox) return undefined;
+      const current = ctx.get?.('sandboxPolicy')?.resolve({ session: exec.agent.session });
+      if (ctx.get?.('shell')?.sandboxMode !== undefined && ['read-only', 'workspace-write'].includes(current?.mode)
+          && current.mode === permit.sandbox.mode && current.workspaceRoot === permit.sandbox.workspaceRoot) return undefined;
+    }
+    return '该调用未完成本插件的检查，或执行前目录、参数、沙箱权限已改变，已阻止执行。';
+  });
   ctx.on('tools/result', exec => { passed.delete(exec.token); });
 
   const command = (name, description, handler) => ctx.commands.register({ name, description, recordInput: false,
@@ -206,7 +228,7 @@ export async function install(ctx, config, defineTool) {
     },
   });
   command('guard', '查看保护状态、使用说明和当前记忆。', async ({ agent }) =>
-    `记忆与操作保护正在运行。\n\n普通查看工具可直接使用；脚本、文件修改和未知工具需中文说明与真人逐次确认。\n\n/guard-check：无副作用地验证实际工具拦截\n/remember 内容：保存到当前项目\n/remember global 内容：保存为全局记忆\n/forget 完整ID：停用记忆并保留历史\n/guard-detail：查看最近一次确认的完整技术详情\n/guard-history：查看最近的授权记录\n\n${memoryText(store.list(scopeOf(agent)))}`);
+    `记忆与操作保护正在运行，版本 0.2.0。\n\n${mode === 'balanced' ? '当前为日常模式：项目内普通读写和安全搜索直接执行；常规检查命令仅在宿主沙箱受限时自动执行。删除、清理、项目外修改和其他不确定操作仍需确认。' : '当前为严格模式：文件修改、脚本和未知工具逐次确认。'}\n\n中文说明按任务计划、关键进展和完成结果展示，不逐条打断常规操作。\n\n/guard-check：无副作用地验证实际工具拦截\n/remember 内容：保存到当前项目\n/remember global 内容：保存为全局记忆\n/forget 完整ID：停用记忆并保留历史\n/guard-detail：查看最近一次确认的完整技术详情\n/guard-history：查看最近的授权记录\n\n${memoryText(store.list(scopeOf(agent)))}`);
   command('guard-check', '用无副作用的模拟工具，检查未获授权的调用是否真的被拦住。', async ({ agent, signal }) => {
     if (typeof ctx.tools.modeFor === 'function' && ctx.tools.modeFor(agent) !== 'native') {
       throw new Error('当前不是 native 工具模式，无法进行这项自检。');

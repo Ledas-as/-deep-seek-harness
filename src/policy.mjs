@@ -4,7 +4,7 @@ import path from 'node:path';
 // Exact names only: an unknown MCP tool is never trusted by a name substring.
 // Recursive content search can include credentials. It receives a human review.
 const READ_TOOLS = new Set(['read', 'read_image', 'glob']);
-const INTERNAL_TOOLS = new Set(['guard_plan', 'guard_memory_list', 'guard_memory_propose']);
+const INTERNAL_TOOLS = new Set(['guard_plan', 'guard_memory_list', 'guard_memory_propose', 'guard_search']);
 const INTERACTION_TOOLS = new Set(['ask_user_question']);
 const SHELL_TOOLS = new Set(['bash', 'pwsh', 'bash_persistent', 'pwsh_persistent', 'terminal', 'run_code']);
 const PATH_KEYS = new Set(['file_path', 'path', 'directory', 'workdir', 'cwd']);
