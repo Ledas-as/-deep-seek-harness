@@ -1,6 +1,6 @@
 # dsh-memory-guard · 记忆与操作保护
 
-给 DeepSeek Harness 使用的第三方插件，适配 Windows、DSH **0.2.1-rc.2**。当前版本 **0.2.0**，采用 MIT License，与 DeepSeek 官方无隶属关系。
+给 DeepSeek Harness 使用的第三方插件，适配 Windows、DSH **0.2.1-rc.2**。当前版本 **0.2.1**，采用 MIT License，与 DeepSeek 官方无隶属关系。
 
 目的：记住你明确保存的规矩，用中文说明计划和关键进展，让项目内常规操作连续完成，危险和不确定操作再单独确认。
 
@@ -14,9 +14,9 @@
 
 接下来查看、搜索和普通编辑会连续进行。发现关键问题、改变方向或需要你决定时再说明，不每调用一个工具就停下来。若要删除日志或清理目录，再解释具体目标、原因和影响并请求确认。
 
-需要授权时，弹出的主界面会展示中文操作说明、原因、影响、操作类型和参数中明确给出的文件位置。你可以选择“拒绝执行”或“仅允许这一次”。不会拿整段代码当确认正文。
+需要授权时，0.2.1 的确认卡片优先展示“操作”和“影响（模型说明）”，再用一句话提醒风险。参数中明确给出的位置最多展示 3 个，其余数量会提示在详情查看。你可以选择“拒绝执行”或“仅允许这一次”。不会拿整段代码当确认正文。
 
-想看完整命令时，输入 `/guard-detail`。技术详情按需查看，授权始终绑定完整工具名和本次原始参数。
+操作原因、完整位置清单、当前目录、工具能力和完整命令移到 `/guard-detail`，按需查看。授权始终绑定完整工具名和本次原始参数，0.2.1 没有改变权限规则。
 
 ## 实际保护规则
 
@@ -28,7 +28,7 @@
 - 一次性 `bash`/`pwsh` 的简单常规命令可在宿主已提供 `read-only` 或 `workspace-write` 沙箱时自动继续：`npm test`、`npm/pnpm run test/lint/typecheck/build/check`、`pnpm test`、`yarn test/lint/typecheck/build/check`、`node --test`、`node --check 相对文件`、`git status`（可附 `--short/--porcelain/--branch`）。不自动放行命令拼接、任意程序、持久 shell、解释器内联代码或显式提权。
 - 删除、清理、安装、进程控制、发布、项目外修改、未受限命令和未知工具仍先登记中文说明，再由真人逐次确认。模型不能仅用“测试”或“只读”文字自称安全。
 - 常规调用继续经过宿主策略，不会自动批准 DSH 自己的审批；宿主仍可因只读模式、先读后改要求或沙箱限制拒绝执行。
-- 模型填写的目的和影响会明确标成“模型说明”；插件另外说明工具能力可能带来的风险。
+- 模型填写的影响会明确标成“模型说明”；插件另用一句话提醒工具能力可能带来的风险，完整解释保留在详情中。
 - 确认只对当前会话、当前目录和完全相同的参数生效一次。拒绝、取消、确认界面不可用或插件重载时停止执行。自动调用也会在最后核对参数、目录和受限沙箱是否改变。
 - 最终 `ctx.tools.guard()` 检查会阻止未通过本插件检查的调用。其他普通 policy hook 直接返回 `allow`，不能覆盖这个拒绝。
 - 模型不能通过 `plugin_manager` 和已识别的 Cordis 动态插件入口停用自己的保护。用户仍可在扩展管理中手动管理。
@@ -75,7 +75,7 @@ Windows 默认安装位置也可使用 DSH 自带 CLI：
 安装本地包的 CLI 示例；请先把路径换成实际生成的包路径：
 
 ```powershell
-& "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add 'C:\完整路径\dsh-memory-guard-0.2.0.tgz'
+& "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" plugin --profile desktop add 'C:\完整路径\dsh-memory-guard-0.2.1.tgz'
 ```
 
 该操作会更改 DSH 的扩展配置。安装源码目录同样可行，但不要在安装后移动那个目录。安装包内没有 install 脚本，不新增第三方运行依赖；两个 peerDependencies 复用宿主的 Cordis 和 tools API。若安装器提示另一个 DSH 版本不兼容，请停止，不要强行忽略。

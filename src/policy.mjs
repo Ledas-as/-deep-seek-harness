@@ -46,12 +46,12 @@ export function classify(name, args) {
   if (INTERACTION_TOOLS.has(name)) return { kind: 'interaction', label: '向用户询问信息' };
   if (READ_TOOLS.has(name)) return { kind: 'read', label: '查看或搜索文件' };
   if (SHELL_TOOLS.has(name) || /(?:shell|terminal|exec|run_code)/iu.test(name)) {
-    return { kind: 'review', label: '运行命令或脚本', risk: '可以改变或删除文件、启动程序、访问网络；插件无法仅凭文字证明它只会查看。' };
+    return { kind: 'review', label: '运行命令或脚本', notice: '命令可能改动或删除文件，也可能访问网络。', risk: '可以改变或删除文件、启动程序、访问网络；插件无法仅凭文字证明它只会查看。' };
   }
   if (/^(?:write|edit|str_replace_editor|apply_patch)$/u.test(name)) {
-    return { kind: 'review', label: '创建或修改文件', risk: '可能覆盖已有内容，或移除文件中的一部分；需要核对具体目标。' };
+    return { kind: 'review', label: '创建或修改文件', notice: '可能覆盖或移除已有内容，请核对位置。', risk: '可能覆盖已有内容，或移除文件中的一部分；需要核对具体目标。' };
   }
-  return { kind: 'review', label: '调用需要核对的工具', risk: '该工具不在直接放行的查看工具名单里；可能修改文件、外部服务或设置。' };
+  return { kind: 'review', label: '调用需要核对的工具', notice: '工具可能改动文件、服务或设置。', risk: '该工具不在直接放行的查看工具名单里；可能修改文件、外部服务或设置。' };
 }
 
 export function resolvedPaths(args, cwd) {

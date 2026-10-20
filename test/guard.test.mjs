@@ -135,8 +135,8 @@ test('one human answer permits exactly one call with a Chinese review and no raw
   assert.equal((await f.run(f.makeExec('pwsh', args))).kind, 'allow');
   assert.equal((await f.run(f.makeExec('pwsh', args))).kind, 'deny');
   assert.equal(f.questions.length, 1);
-  assert.match(f.questions[0].detail, /准备做：修改指定的测试文件/u);
-  assert.match(f.questions[0].detail, /可以改变或删除文件/u);
+  assert.match(f.questions[0].detail, /\*\*操作\*\*：修改指定的测试文件/u);
+  assert.match(f.questions[0].detail, /命令可能改动或删除文件/u);
   assert.ok(!f.questions[0].detail.includes(args.command));
   const detail = await f.commands.get('guard-detail').handler({ agent: f.agent });
   assert.ok(detail.text.includes(args.command));

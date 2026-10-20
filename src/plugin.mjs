@@ -62,9 +62,9 @@ export async function install(ctx, config, defineTool) {
       const result = await ctx.userQuestions.ask({
         agent: exec.agent,
         signal: exec.signal,
-        questions: [{ id, header: '本次操作确认', question, detail,
-          options: [{ label: '拒绝执行', description: '停止这次操作，文件保持当前状态。' },
-            { label: APPROVE, description: '只允许当前这组参数，不授权之后的操作。' }],
+        questions: [{ id, header: '操作确认', question, detail,
+          options: [{ label: '拒绝执行', description: '取消这一步。' },
+            { label: APPROVE, description: '只同意这一次。' }],
         }],
       });
       const answers = result?.answers?.filter(item => item.id === id) ?? [];
@@ -91,9 +91,9 @@ export async function install(ctx, config, defineTool) {
     {
       tool_name: { type: 'string', required: true, description: '接下来要调用的完整工具名。' },
       arguments_json: { type: 'string', required: true, description: '接下来那次调用的完整参数，JSON 对象字符串，必须逐项一致。' },
-      summary: { type: 'string', required: true, description: '一句简单中文：具体准备做什么，不填代码。' },
-      reason: { type: 'string', required: true, description: '一句简单中文：为什么需要这一步。' },
-      impact: { type: 'string', required: true, description: '一句简单中文：会改哪些东西，是否可能丢失已有内容；不确定就写明。' },
+      summary: { type: 'string', required: true, description: '用一句简单中文写具体动作和目标，建议 40 字以内，不填代码。' },
+      reason: { type: 'string', required: true, description: '一句简单中文：为什么需要这一步。仅在详情中展示。' },
+      impact: { type: 'string', required: true, description: '用一句简单中文写影响，建议 80 字以内；说明会改哪里、是否覆盖或删除，不确定就写明，不重复目的。' },
     }, async (args, exec) => {
       if (typeof args.arguments_json !== 'string' || args.arguments_json.length > 256_000) throw new Error('参数过长，请拆成更小的操作。');
       const targetArgs = JSON.parse(args.arguments_json);
@@ -185,18 +185,15 @@ export async function install(ctx, config, defineTool) {
     if (targets.some(target => within(target, PACKAGE_DIR) || within(target, store.directory))) {
       return { kind: 'deny', reason: '模型不能修改保护插件或记忆记录；请由用户手动管理。' };
     }
-    recent.set(exec.agent.session, { ...plan, targets });
+    recent.set(exec.agent.session, { ...plan, targets, policy });
     const detail = [
-      `准备做：${markdownText(plan.summary)}`,
-      `原因：${markdownText(plan.reason)}`,
-      `模型说明的影响：${markdownText(plan.impact)}`,
-      `插件核对的操作类型：${policy.label}。`,
-      `需要注意：${policy.risk ?? '该工具并非插件自己的操作，不能按内部工具直接放行。'}`,
-      `当前目录：${markdownText(plan.scope)}`,
-      targets.length ? `参数中明确指定的位置：\n${targets.map(target => `- ${markdownText(target)}`).join('\n')}\n\n脚本还可能涉及其他位置，上面的清单不是完整影响证明。` : '工具没有提供可直接核对的文件路径；影响范围需要结合任务判断。',
-      '本次只批准当前这一组参数。完整命令和参数可用 /guard-detail 查看，确认正文只展示中文说明。',
+      `**操作**：${markdownText(plan.summary)}`,
+      `**影响（模型说明）**：${markdownText(plan.impact)}`,
+      ...(targets.length ? [`**位置（参数提供）**\n${targets.slice(0, 3).map(target => `- ${markdownText(target)}`).join('\n')}${targets.length > 3 ? `\n- 另有 ${targets.length - 3} 个位置，见详情。` : ''}`] : []),
+      `**注意**：${policy.notice ?? '请核对这次操作的实际影响。'}`,
+      '仅本次有效 · 详情：/guard-detail',
     ].join('\n\n');
-    const approved = await askHuman(exec, '是否允许这一次操作？', detail);
+    const approved = await askHuman(exec, '允许这次操作吗？', detail);
     await store.audit(exec.name, approved ? 'human-approved' : 'denied');
     if (!approved) return { kind: 'deny', reason: '用户未明确同意，或真人确认界面不可用；操作已停止。不要改换工具重试。' };
     if (disposed || exec.signal?.aborted || plan.scope !== scopeOf(exec.agent)) return { kind: 'deny', reason: '确认期间会话或目录已改变，请重新说明并确认。' };
@@ -228,7 +225,7 @@ export async function install(ctx, config, defineTool) {
     },
   });
   command('guard', '查看保护状态、使用说明和当前记忆。', async ({ agent }) =>
-    `记忆与操作保护正在运行，版本 0.2.0。\n\n${mode === 'balanced' ? '当前为日常模式：项目内普通读写和安全搜索直接执行；常规检查命令仅在宿主沙箱受限时自动执行。删除、清理、项目外修改和其他不确定操作仍需确认。' : '当前为严格模式：文件修改、脚本和未知工具逐次确认。'}\n\n中文说明按任务计划、关键进展和完成结果展示，不逐条打断常规操作。\n\n/guard-check：无副作用地验证实际工具拦截\n/remember 内容：保存到当前项目\n/remember global 内容：保存为全局记忆\n/forget 完整ID：停用记忆并保留历史\n/guard-detail：查看最近一次确认的完整技术详情\n/guard-history：查看最近的授权记录\n\n${memoryText(store.list(scopeOf(agent)))}`);
+    `记忆与操作保护正在运行，版本 0.2.1。\n\n${mode === 'balanced' ? '当前为日常模式：项目内普通读写和安全搜索直接执行；常规检查命令仅在宿主沙箱受限时自动执行。删除、清理、项目外修改和其他不确定操作仍需确认。' : '当前为严格模式：文件修改、脚本和未知工具逐次确认。'}\n\n中文说明按任务计划、关键进展和完成结果展示，不逐条打断常规操作。\n\n/guard-check：无副作用地验证实际工具拦截\n/remember 内容：保存到当前项目\n/remember global 内容：保存为全局记忆\n/forget 完整ID：停用记忆并保留历史\n/guard-detail：查看最近一次确认的完整技术详情\n/guard-history：查看最近的授权记录\n\n${memoryText(store.list(scopeOf(agent)))}`);
   command('guard-check', '用无副作用的模拟工具，检查未获授权的调用是否真的被拦住。', async ({ agent, signal }) => {
     if (typeof ctx.tools.modeFor === 'function' && ctx.tools.modeFor(agent) !== 'native') {
       throw new Error('当前不是 native 工具模式，无法进行这项自检。');
@@ -266,7 +263,18 @@ export async function install(ctx, config, defineTool) {
     const json = stableJson({ tool: plan.tool, arguments: plan.args });
     const longest = Math.max(2, ...Array.from(json.matchAll(/`+/gu), match => match[0].length));
     const fence = '`'.repeat(longest + 1);
-    return `操作说明：${plan.summary}\n\n参数指纹：${plan.key}\n\n${fence}json\n${json}\n${fence}\n\n这些参数仅对应这一次操作。`;
+    return [
+      `操作：${markdownText(plan.summary)}`,
+      `原因：${markdownText(plan.reason)}`,
+      `影响（模型说明）：${markdownText(plan.impact)}`,
+      `操作类型：${plan.policy.label}。`,
+      `风险：${plan.policy.risk ?? '该工具不能按插件内部工具直接放行。'}`,
+      `当前目录：${markdownText(plan.scope)}`,
+      plan.targets.length ? `参数中明确指定的位置：\n${plan.targets.map(target => `- ${markdownText(target)}`).join('\n')}\n\n脚本还可能涉及其他位置，这不是完整影响范围。` : '参数中没有可直接核对的文件路径，脚本仍可能涉及其他位置。',
+      `参数指纹：${plan.key}`,
+      `${fence}json\n${json}\n${fence}`,
+      '这些参数仅对应这一次操作。',
+    ].join('\n\n');
   });
   command('guard-history', '查看最近的授权结果，不记录完整命令或文件内容。', async () => {
     const items = store.events.filter(event => event.kind === 'audit').slice(-20);
