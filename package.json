@@ -1,0 +1,28 @@
+{
+  "name": "dsh-memory-guard",
+  "version": "0.1.2",
+  "description": "中文操作说明、经用户确认的长期记忆，以及默认拒绝绕过的工具执行保护。",
+  "repository": { "type": "git", "url": "https://github.com/Ledas-as/-deep-seek-harness.git" },
+  "homepage": "https://github.com/Ledas-as/-deep-seek-harness#readme",
+  "bugs": { "url": "https://github.com/Ledas-as/-deep-seek-harness/issues" },
+  "keywords": ["deepseek-harness", "dsh", "dsh-plugin", "memory", "tool-guard"],
+  "type": "module",
+  "main": "src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": ["src/", "locale/", "test/", "scripts/", "cordis.patch.yml", "README.md", "VALIDATION.md", "LICENSE"],
+  "engines": { "node": ">=22" },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.0.5",
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.2"
+  },
+  "dsh": { "bundle": { "patch": "cordis.patch.yml" } },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check": "node scripts/check.mjs"
+  },
+  "license": "MIT"
+}

@@ -1,0 +1,3 @@
+- insert:
+    - id: memory-guard
+      name: dsh-memory-guard

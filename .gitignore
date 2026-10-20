@@ -1,0 +1,13 @@
+node_modules/
+.env*
+*.pem
+*.key
+*.log
+*.tgz
+*.zip
+memory.jsonl
+DSH-Memory-Guard/
+.data/
+coverage/
+.DS_Store
+Thumbs.db
