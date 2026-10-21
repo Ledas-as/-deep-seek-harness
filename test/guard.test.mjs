@@ -18,22 +18,38 @@ async function fixture(options = {}) {
   const sections = [];
   const disposers = [];
   const questions = [];
+  const approvals = [];
+  const reviews = [];
   let answer = 'allow';
+  let approvalOutcome = 'allowed-once';
+  let auto = options.auto ?? false;
+  let fullAccess = options.fullAccess ?? false;
+  let autoDecision = 'allow';
   let cwd = root;
   let sandbox = options.sandbox;
   let confines = options.confines ?? true;
   const ctx = {
     get: name => name === 'shell' ? { sandboxMode: confines ? 'workspace-write' : undefined }
-      : name === 'sandboxPolicy' ? { resolve: () => ({ mode: sandbox, workspaceRoot: options.sandboxRoot ?? cwd }) } : undefined,
+      : name === 'sandboxPolicy' ? { resolve: () => ({ mode: sandbox, workspaceRoot: options.sandboxRoot ?? cwd }) }
+      : name === 'permissionPresets' ? { names: ['danger-full-access', ...(auto ? ['auto'] : [])],
+        current: () => auto ? 'auto' : fullAccess ? 'danger-full-access' : 'custom' }
+      : name === 'approval' && !options.noApproval ? { request: async request => {
+        approvals.push(request);
+        const list = listeners.get('approval/request') ?? [];
+        const dispatch = i => i === list.length ?
+          (typeof approvalOutcome === 'function' ? approvalOutcome(request) : approvalOutcome)
+          : list[i](request, () => dispatch(i + 1));
+        return dispatch(0);
+      } } : undefined,
     tools: { register: tool => { definitions.set(tool.name, tool); return () => definitions.delete(tool.name); },
       get: name => definitions.get(name), guard: guard => guards.push(guard) },
     systemPrompt: { section: section => sections.push(section) },
     commands: { register: command => commands.set(command.name, command) },
     workingDirectory: { get: () => cwd },
     effect: callback => disposers.push(callback()),
-    on: (name, listener) => {
+    on: (name, listener, settings) => {
       if (!listeners.has(name)) listeners.set(name, []);
-      listeners.get(name).push(listener);
+      listeners.get(name)[settings?.prepend ? 'unshift' : 'push'](listener);
     },
     userQuestions: { ask: async request => {
       questions.push(request.questions[0]);
@@ -48,6 +64,15 @@ async function fixture(options = {}) {
   definitions.set('unknown_mcp_delete', { name: 'unknown_mcp_delete' });
   definitions.set('read', { name: 'read' });
   definitions.set('run_code', { name: 'run_code' });
+  // Same ask/deny merge contract as the host Auto listener; no model or real tools.
+  ctx.on('tools/pre-execute', async (exec, next) => {
+    if (!auto) return next();
+    reviews.push(exec.name);
+    if (autoDecision === 'failed') return { kind: 'deny', reason: '自动审查不可用' };
+    const downstream = await next();
+    return autoDecision === 'deny' && downstream.kind === 'allow'
+      ? { kind: 'ask', reason: '宿主自动审查要求确认' } : downstream;
+  });
   const state = await install(ctx, { dataDir: path.join(root, 'memory'),
     ...(options.defaultMode ? {} : { mode: options.mode ?? 'strict' }) }, value => value);
   const agent = { session: {} };
@@ -60,7 +85,14 @@ async function fixture(options = {}) {
   };
   const final = exec => guards.map(guard => guard(exec)).find(reason => reason !== undefined);
   const run = async exec => {
-    const decision = await pre(exec);
+    let decision = await pre(exec);
+    if (decision.kind === 'ask') {
+      try {
+        const outcome = await ctx.get('approval')?.request({ agent: exec.agent, toolName: exec.name,
+          callId: exec.callId, reason: decision.reason, displayReason: decision.displayReason, signal: exec.signal });
+        decision = outcome === 'allowed-once' ? { kind: 'allow' } : { kind: 'deny', reason: '宿主未批准操作' };
+      } catch { decision = { kind: 'deny', reason: '审批不可用' }; }
+    }
     if (decision.kind === 'allow') {
       const reason = final(exec);
       if (reason) return { kind: 'deny', reason };
@@ -79,8 +111,11 @@ async function fixture(options = {}) {
     tool_name: name, arguments_json: JSON.stringify(args), summary: '修改指定的测试文件',
     reason: '完成用户指定的测试任务', impact: '可能改变文件现有内容，需要核对目标',
   }, makeExec('guard_plan', {}, owner));
-  return { root, state, ctx, agent, commands, definitions, sections, questions, makeExec, pre, final, run, plan,
+  return { root, state, ctx, agent, commands, definitions, sections, questions, approvals, reviews, makeExec, pre, final, run, plan,
     setAnswer: value => { answer = value; }, setCwd: value => { cwd = value; },
+    setAuto: value => { auto = value; }, setAutoDecision: value => { autoDecision = value; },
+    setFullAccess: value => { fullAccess = value; },
+    setApprovalOutcome: value => { approvalOutcome = value; },
     setSandbox: value => { sandbox = value; }, setConfinement: value => { confines = value; },
     dispose: () => disposers.forEach(callback => callback()) };
 }
@@ -362,7 +397,7 @@ test('commands that require arguments advertise an input hint to the native UI',
   assert.equal(f.commands.get('guard-check').input, undefined);
 });
 
-test('balanced is the default; routine project writes and edits need no plan or question', async () => {
+test('adaptive is the default; routine project writes and edits need no plan or question', async () => {
   const f = await fixture({ defaultMode: true });
   for (const [name, args] of [
     ['write', { file_path: path.join(f.root, 'notes.txt'), content: '普通内容' }],
@@ -371,8 +406,8 @@ test('balanced is the default; routine project writes and edits need no plan or 
   ]) assert.equal((await f.run(f.makeExec(name, args))).kind, 'allow', name);
   assert.equal(f.questions.length, 0);
   const status = await f.commands.get('guard').handler({ agent: f.agent });
-  assert.match(status.text, /日常模式/u);
-  assert.match(f.sections.find(section => section.name === 'memory-guard:rules').text, /不要每调用一个工具/u);
+  assert.match(status.text, /协作模式/u);
+  assert.match(f.sections.find(section => section.name === 'memory-guard:rules').text({ agent: f.agent }), /不要每调用一个工具/u);
 });
 
 test('automatic project changes never grant calls outside the project or to protected paths', async () => {
@@ -505,4 +540,241 @@ test('final guard revokes automatic permits after argument, cwd or confinement c
   assert.equal((await f.pre(changedSandbox)).kind, 'allow');
   f.setSandbox('danger-full-access');
   assert.ok(f.final(changedSandbox));
+});
+
+test('active host Auto reviews environment checks, searches and experts without plugin questions', async () => {
+  const f = await fixture({ defaultMode: true, auto: true, confines: false });
+  const calls = [
+    ['pwsh', { command: 'node --version; npm --version', description: 'Check environment' }],
+    ['pwsh', { command: 'Get-ChildItem -LiteralPath .', description: '查看当前目录内容' }],
+    ['grep', { pattern: 'Remotion', path: f.root }],
+    ['list_t_experts', {}], ['summon_t_expert', { expert: 'visual-designer', task: '提供创意方向' }],
+    ['summon_t_experts', { experts: ['designer', 'developer'], task: '检查方案' }],
+    ['subagent', { task: '分析项目结构' }], ['pwsh', { command: 'npm install' }],
+  ];
+  for (const [name, args] of calls) assert.equal((await f.run(f.makeExec(name, args))).kind, 'allow', name);
+  assert.deepEqual(f.reviews, calls.map(([name]) => name));
+  assert.equal(f.questions.length, 0);
+  assert.equal(f.approvals.length, 0);
+});
+
+test('explicit risks ask through the host once, without a prior plan or a plugin dialog', async () => {
+  const f = await fixture({ mode: 'adaptive', auto: true });
+  const calls = [
+    ['pwsh', { command: 'Remove-Item sample.txt', description: '只读查看测试文件' }],
+    ['pwsh', { command: 'git push origin main' }],
+    ['pwsh', { command: 'Stop-Process -Name example' }],
+    ['unknown_mcp_delete', { path: 'sample.txt' }],
+    ['apply_patch', { patch: '*** Delete File: sample.txt' }],
+    ['write', { file_path: path.join(f.root, '..', 'outside.txt'), content: '新内容' }],
+    ['write', { file_path: path.join(f.root, 'notes.txt'), content: '' }],
+  ];
+  f.setApprovalOutcome('rejected');
+  for (const [name, args] of calls) assert.equal((await f.run(f.makeExec(name, args))).kind, 'deny');
+  assert.equal(f.approvals.length, calls.length);
+  assert.equal(f.questions.length, 0);
+  assert.match(f.approvals[0].displayReason.zh, /删除/u);
+  assert.ok(!f.approvals[0].displayReason.zh.includes('Remove-Item'));
+  f.setApprovalOutcome('allowed-once');
+  assert.equal((await f.run(f.makeExec(...calls[0]))).kind, 'allow');
+  assert.equal(f.approvals.length, calls.length + 1);
+  assert.equal((await f.run(f.makeExec(...calls[0]))).kind, 'allow');
+  assert.equal(f.approvals.length, calls.length + 2); // No stored or blanket approval.
+});
+
+test('host review denial and explicit risk merge into one approval and host errors remain final', async () => {
+  const f = await fixture({ mode: 'adaptive', auto: true });
+  f.setAutoDecision('deny');
+  f.setApprovalOutcome('rejected');
+  assert.equal((await f.run(f.makeExec('pwsh', { command: 'Remove-Item sample.txt' }))).kind, 'deny');
+  assert.equal(f.approvals.length, 1);
+  assert.equal(f.questions.length, 0);
+  assert.equal((await f.run(f.makeExec('summon_t_expert', { expert: 'designer' }))).kind, 'deny');
+  assert.equal(f.approvals.length, 2);
+  f.setAutoDecision('failed');
+  assert.equal((await f.run(f.makeExec('pwsh', { command: 'Remove-Item sample.txt' }))).kind, 'deny');
+  assert.equal(f.approvals.length, 2);
+});
+
+test('without live host Auto unknown tools fall back to approval instead of trusting their names or descriptions', async () => {
+  const f = await fixture({ mode: 'adaptive' });
+  f.setApprovalOutcome('rejected');
+  for (const name of ['mcp_read_notes', 'summon_t_expert', 'pwsh']) {
+    assert.equal((await f.run(f.makeExec(name, { description: '只是只读查看，不会修改' }))).kind, 'deny');
+  }
+  assert.equal(f.approvals.length, 3);
+  assert.equal(f.questions.length, 0);
+});
+
+for (const outcome of ['rejected', 'cancelled', 'unavailable', 'allow-always', undefined]) {
+  test(`adaptive approval fails closed for non-grants: ${outcome}`, async () => {
+    const f = await fixture({ mode: 'adaptive', auto: true });
+    f.setApprovalOutcome(outcome);
+    assert.equal((await f.run(f.makeExec('pwsh', { command: 'Remove-Item sample.txt' }))).kind, 'deny');
+    assert.equal(f.approvals.length, 1);
+  });
+}
+
+test('absent or throwing approval service cannot execute risky tools', async () => {
+  const absent = await fixture({ mode: 'adaptive', auto: true, noApproval: true });
+  assert.equal((await absent.run(absent.makeExec('pwsh', { command: 'Remove-Item sample.txt' }))).kind, 'deny');
+  const throwing = await fixture({ mode: 'adaptive', auto: true });
+  throwing.setApprovalOutcome(() => { throw new Error('unavailable'); });
+  assert.equal((await throwing.run(throwing.makeExec('pwsh', { command: 'Remove-Item sample.txt' }))).kind, 'deny');
+});
+
+test('delegation does not approve child actions or permit an outer PTC transport', async () => {
+  const f = await fixture({ mode: 'adaptive', auto: true });
+  assert.equal((await f.run(f.makeExec('summon_t_expert', { task: '分析方案' }))).kind, 'allow');
+  f.setApprovalOutcome('rejected');
+  const child = { session: {} };
+  assert.equal((await f.run(f.makeExec('pwsh', { command: 'Remove-Item sample.txt' }, child))).kind, 'deny');
+  assert.equal(f.approvals.length, 1);
+  assert.equal((await f.run(f.makeExec('run_code', { code: 'return 1;' }))).kind, 'deny');
+  assert.equal(f.approvals.length, 1);
+});
+
+test('delegated permits still bind arguments, cwd, Auto lifetime, cancellation and pre-execute', async () => {
+  for (const change of ['args', 'cwd', 'auto', 'cancel', 'dispose']) {
+    const f = await fixture({ mode: 'adaptive', auto: true });
+    const exec = f.makeExec('pwsh', { command: 'node --version' });
+    assert.ok(f.final(exec));
+    assert.equal((await f.pre(exec)).kind, 'allow');
+    if (change === 'args') exec.arguments.command = 'Remove-Item sample.txt';
+    if (change === 'cwd') f.setCwd(path.dirname(f.root));
+    if (change === 'auto') f.setAuto(false);
+    if (change === 'cancel') { const controller = new AbortController(); controller.abort(); exec.signal = controller.signal; }
+    if (change === 'dispose') f.dispose();
+    assert.ok(f.final(exec), change);
+  }
+});
+
+test('adaptive keeps sensitive paths, self-management and symlink boundaries protected', async t => {
+  const f = await fixture({ mode: 'adaptive', auto: true });
+  for (const [name, args] of [['read', { file_path: '.env.local' }], ['plugin_manager', {}],
+    ['read', { file_path: path.join(f.root, 'memory', 'memory.jsonl') }]]) {
+    assert.equal((await f.run(f.makeExec(name, args))).kind, 'deny');
+  }
+  assert.equal(f.reviews.length, 0); // Hard denial precedes the review model.
+  assert.equal(f.approvals.length, 0);
+  const outside = await mkdtemp(path.join(tmpdir(), 'dsh-adaptive-outside-'));
+  const link = path.join(f.root, 'linked');
+  try { await symlink(outside, link, process.platform === 'win32' ? 'junction' : 'dir'); }
+  catch (error) { if (error.code === 'EPERM') return t.skip('Windows 未授权创建 symlink'); throw error; }
+  f.setApprovalOutcome('rejected');
+  assert.equal((await f.run(f.makeExec('write', { file_path: path.join(link, 'new.txt'), content: '内容' }))).kind, 'deny');
+  assert.equal(f.approvals.length, 1);
+});
+
+test('adaptive risk approvals revoke changed arguments before dispatch and preserve memory confirmation', async () => {
+  const f = await fixture({ mode: 'adaptive', auto: true });
+  const exec = f.makeExec('pwsh', { command: 'Remove-Item sample.txt' });
+  f.setApprovalOutcome(() => { exec.arguments.command = 'Remove-Item another.txt'; return 'allowed-once'; });
+  assert.equal((await f.run(exec)).kind, 'deny');
+  const tool = f.definitions.get('guard_memory_propose');
+  const args = { text: '请用简单中文汇报', scope: 'project' };
+  assert.equal((await f.run(f.makeExec('guard_memory_propose', args))).kind, 'allow');
+  await tool.execute(args, f.makeExec('guard_memory_propose', args));
+  assert.equal(f.questions.length, 1);
+  assert.match((await f.commands.get('guard').handler({ agent: f.agent })).text, /请用简单中文汇报/u);
+  const raw = await readFile(f.state.store.file, 'utf8');
+  assert.ok(!raw.includes('Remove-Item'));
+});
+
+test('returning allow over a pending ask cannot fake host approval', async () => {
+  const f = await fixture({ mode: 'adaptive', auto: true });
+  const exec = f.makeExec('pwsh', { command: 'Remove-Item sample.txt' });
+  assert.equal((await f.pre(exec)).kind, 'ask');
+  assert.match(f.final(exec), /尚未取得/u);
+  const ordinary = f.makeExec('summon_t_expert', { task: '分析方案' });
+  f.setAutoDecision('deny');
+  assert.equal((await f.pre(ordinary)).kind, 'ask');
+  assert.match(f.final(ordinary), /尚未取得/u);
+});
+
+test('full access does not request approval for network, experts, commands or outside edits', async () => {
+  const f = await fixture({ defaultMode: true, fullAccess: true, noApproval: true, confines: false });
+  const calls = [
+    ['web_search', { query: 'DSH-Claude-Style-Reasoning-Slider' }],
+    ['mcp__github__fetch_repository', { url: 'https://github.com/example/plugin' }],
+    ['summon_t_expert', { expert: 'designer', task: '分析项目' }],
+    ['pwsh', { command: 'node --version', description: 'Read version' }],
+    ['pwsh', { command: 'Remove-Item sample.txt' }],
+    ['unknown_mcp_delete', { path: 'sample.txt' }],
+    ['write', { file_path: path.join(f.root, '..', 'outside.txt'), content: '模拟内容' }],
+    ['run_code', { code: 'return 1;' }],
+  ];
+  for (const [name, args] of calls) assert.equal((await f.run(f.makeExec(name, args))).kind, 'allow', name);
+  assert.equal(f.approvals.length, 0);
+  assert.equal(f.questions.length, 0);
+  assert.equal(f.reviews.length, 0);
+  const status = await f.commands.get('guard').handler({ agent: f.agent });
+  assert.match(status.text, /已尊重 DSH 完全权限/u);
+});
+
+test('full access keeps existing sensitive-content and self-management denials', async () => {
+  const f = await fixture({ mode: 'adaptive', fullAccess: true });
+  for (const [name, args] of [['read', { file_path: '.env.local' }], ['plugin_manager', {}],
+    ['write', { file_path: path.join(f.root, 'memory', 'memory.jsonl'), content: '模拟内容' }]]) {
+    assert.equal((await f.run(f.makeExec(name, args))).kind, 'deny');
+  }
+  assert.equal(f.approvals.length, 0);
+  assert.equal(f.questions.length, 0);
+  assert.equal((await f.commands.get('guard-check').handler({ agent: f.agent })).kind, 'success');
+});
+
+test('full-access permits are revoked when the selected mode, args, cwd, signal or plugin changes', async () => {
+  for (const change of ['mode', 'args', 'cwd', 'cancel', 'dispose']) {
+    const f = await fixture({ mode: 'adaptive', fullAccess: true });
+    const exec = f.makeExec('web_search', { query: 'example plugin' });
+    assert.ok(f.final(exec));
+    assert.equal((await f.pre(exec)).kind, 'allow');
+    if (change === 'mode') { f.setFullAccess(false); f.setAuto(true); }
+    if (change === 'args') exec.arguments.query = 'changed query';
+    if (change === 'cwd') f.setCwd(path.dirname(f.root));
+    if (change === 'cancel') { const controller = new AbortController(); controller.abort(); exec.signal = controller.signal; }
+    if (change === 'dispose') f.dispose();
+    assert.ok(f.final(exec), change);
+  }
+});
+
+test('full access still honors downstream host denial and does not fabricate host approval', async () => {
+  const f = await fixture({ mode: 'adaptive', fullAccess: true });
+  f.ctx.on('tools/pre-execute', async () => ({ kind: 'deny', reason: '宿主拒绝' }));
+  assert.equal((await f.run(f.makeExec('web_search', { query: 'example' }))).kind, 'deny');
+  const g = await fixture({ mode: 'adaptive', fullAccess: true });
+  g.ctx.on('tools/pre-execute', async () => ({ kind: 'ask', reason: '宿主仍需审批' }));
+  const exec = g.makeExec('web_search', { query: 'example' });
+  assert.equal((await g.pre(exec)).kind, 'ask');
+  assert.match(g.final(exec), /尚未取得/u);
+});
+
+test('approval never or an unavailable permission service alone cannot grant full access', async () => {
+  const f = await fixture({ mode: 'adaptive' });
+  const originalGet = f.ctx.get;
+  f.ctx.get = name => name === 'approval' ? { effectivePolicy: () => 'never' } : originalGet(name);
+  assert.equal((await f.pre(f.makeExec('web_search', { query: 'example' }))).kind, 'ask');
+  f.setFullAccess(true);
+  f.ctx.get = name => name === 'permissionPresets' ? undefined : originalGet(name);
+  assert.equal((await f.pre(f.makeExec('web_search', { query: 'example' }))).kind, 'ask');
+  f.ctx.get = name => name === 'permissionPresets' ? { names: ['danger-full-access'], current() { throw new Error('offline'); } } : originalGet(name);
+  assert.equal((await f.pre(f.makeExec('web_search', { query: 'example' }))).kind, 'ask');
+});
+
+test('Auto child with never approvals is not interpreted as full access', async () => {
+  const f = await fixture({ mode: 'adaptive', auto: true });
+  f.setApprovalOutcome('rejected');
+  assert.equal((await f.run(f.makeExec('pwsh', { command: 'Remove-Item sample.txt' }, { session: {} }))).kind, 'deny');
+  assert.equal(f.approvals.length, 1);
+});
+
+test('adaptive prompt follows the current full-access selection without keeping stale approval instructions', async () => {
+  const f = await fixture({ defaultMode: true, fullAccess: true });
+  const section = f.sections.find(item => item.name === 'memory-guard:rules');
+  const fullText = section.text({ agent: f.agent });
+  assert.match(fullText, /插件不再要求操作登记或追加审批/u);
+  assert.ok(!fullText.includes('明确的删除、清理、移动、进程控制、发布、项目外编辑、清空文件和显式提权仍需审批'));
+  f.setFullAccess(false);
+  f.setAuto(true);
+  assert.match(section.text({ agent: f.agent }), /明确的删除、清理、移动、进程控制、发布、项目外编辑、清空文件和显式提权仍需审批/u);
 });

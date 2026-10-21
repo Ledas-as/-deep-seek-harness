@@ -1,7 +1,7 @@
 {
   "name": "dsh-memory-guard",
-  "version": "0.2.1",
-  "description": "中文阶段进度与长期记忆；项目内常规操作自动继续，危险和不确定操作单独确认。",
+  "version": "0.3.1",
+  "description": "中文进度与长期记忆；尊重完全权限，复用 DSH 自动审查，减少重复确认。",
   "repository": { "type": "git", "url": "https://github.com/Ledas-as/-deep-seek-harness.git" },
   "homepage": "https://github.com/Ledas-as/-deep-seek-harness#readme",
   "bugs": { "url": "https://github.com/Ledas-as/-deep-seek-harness/issues" },

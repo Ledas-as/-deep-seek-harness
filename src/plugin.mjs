@@ -6,6 +6,7 @@ import { classify, containsLikelySecret, fingerprint, resolvedPaths, sensitivePa
 import { markdownText, rulesFor, validateChinese } from './rules.mjs';
 import { MemoryStore } from './store.mjs';
 import { assessRoutine, canonicalPath, searchProject, within } from './routine.mjs';
+import { extraReview, hostAutoActive, hostFullAccessActive } from './adaptive.mjs';
 
 const PLAN_TTL = 5 * 60_000;
 const APPROVE = '仅允许这一次';
@@ -26,8 +27,8 @@ function memoryText(items) {
 export async function install(ctx, config, defineTool) {
   const unknown = Object.keys(config).filter(key => !['dataDir', 'mode'].includes(key));
   if (unknown.length) throw new Error(`不支持的配置：${unknown.join(', ')}`);
-  const mode = config.mode ?? 'balanced';
-  if (!['balanced', 'strict'].includes(mode)) throw new Error('mode 只支持 balanced 或 strict。');
+  const mode = config.mode ?? 'adaptive';
+  if (!['adaptive', 'balanced', 'strict'].includes(mode)) throw new Error('mode 只支持 adaptive、balanced 或 strict。');
   const dataDir = config.dataDir ?? path.join(process.env.LOCALAPPDATA ?? path.join(homedir(), '.local', 'share'), 'DSH-Memory-Guard');
   const store = await new MemoryStore(dataDir).init();
   const plans = new WeakMap();
@@ -75,9 +76,25 @@ export async function install(ctx, config, defineTool) {
       return false;
     }
   };
+  const trackAsk = (exec, decision) => {
+    const permit = passed.get(exec.token);
+    if (decision.kind === 'ask' && permit) permit.approval = {
+      agent: exec.agent, callId: exec.callId, toolName: exec.name, signal: exec.signal, granted: false,
+    };
+    return decision;
+  };
+  ctx.on('approval/request', async (request, next) => {
+    const pending = [...passed.values()].map(permit => permit.approval).filter(item => item
+      && item.agent === request.agent && item.callId === request.callId
+      && item.toolName === request.toolName && item.signal === request.signal);
+    const outcome = await next();
+    if (outcome === 'allowed-once') for (const item of pending) item.granted = true;
+    return outcome;
+  }, { prepend: true });
 
   ctx.effect(() => () => { disposed = true; passed.clear(); });
-  ctx.systemPrompt.section({ name: 'memory-guard:rules', order: 850, interpolate: false, text: rulesFor(mode) });
+  ctx.systemPrompt.section({ name: 'memory-guard:rules', order: 850, interpolate: false,
+    text: mode === 'adaptive' ? ({ agent }) => rulesFor(mode, hostFullAccessActive(ctx, agent)) : rulesFor(mode) });
   ctx.systemPrompt.section({ name: 'memory-guard:memory', order: 851, interpolate: false,
     text: ({ agent }) => {
       if (!agent) return '';
@@ -87,7 +104,7 @@ export async function install(ctx, config, defineTool) {
   });
 
   register(toolString('guard_plan',
-    '仅在操作需要额外确认时登记完整工具名、原始参数和中文影响说明。项目内常规操作不必重复登记；登记不等于获得授权。',
+    '可选地为需要确认的操作补充中文影响说明；协作模式不要求先登记。登记不等于获得授权。',
     {
       tool_name: { type: 'string', required: true, description: '接下来要调用的完整工具名。' },
       arguments_json: { type: 'string', required: true, description: '接下来那次调用的完整参数，JSON 对象字符串，必须逐项一致。' },
@@ -109,7 +126,7 @@ export async function install(ctx, config, defineTool) {
       const key = fingerprint(args.tool_name, targetArgs);
       entries.set(key, { key, tool: args.tool_name, args: targetArgs, summary, reason, impact,
         scope: scopeOf(exec.agent), expires: Date.now() + PLAN_TTL });
-      return `已登记：${summary}。接下来调用目标工具时，会显示中文影响说明并由真人逐次确认。`;
+      return `已登记：${summary}。说明只对应当前参数，实际执行仍须通过操作策略。`;
     }));
 
   register(toolString('guard_memory_list', '查看用户已确认保存的全局和当前项目记忆。', {},
@@ -145,7 +162,7 @@ export async function install(ctx, config, defineTool) {
     if (!['read', 'internal'].includes(policy.kind) && containsLikelySecret(stableJson(exec.arguments))) {
       return { kind: 'deny', reason: '参数疑似包含明文凭据，已停止执行。' };
     }
-    if (policy.kind === 'review' && typeof exec.arguments.description === 'string') {
+    if (mode !== 'adaptive' && policy.kind === 'review' && typeof exec.arguments.description === 'string') {
       try { validateChinese(exec.arguments.description, '工具操作说明'); }
       catch (error) { return { kind: 'deny', reason: error.message }; }
     }
@@ -165,21 +182,56 @@ export async function install(ctx, config, defineTool) {
         }
       } catch { return { kind: 'deny', reason: '无法安全核对目标路径。' }; }
     }
+    if (mode === 'adaptive' && hostFullAccessActive(ctx, exec.agent)) {
+      passed.set(exec.token, { scope: cwd, key: fingerprint(exec.name, exec.arguments), hostFullAccess: true });
+      return trackAsk(exec, await next());
+    }
+    if (mode === 'adaptive' && exec.name === 'run_code' && exec.parent === undefined) {
+      return { kind: 'deny', reason: '自动审查路径不支持外层 run_code 的直接程序效果，请切换到 native 工具模式；不要换用脚本绕过保护。' };
+    }
     let routine;
-    if (mode === 'balanced' && policy.kind === 'review') {
+    if (mode !== 'strict' && policy.kind === 'review') {
       try { routine = await assessRoutine(ctx, exec, cwd, [store.directory, PACKAGE_DIR]); }
       catch { /* Unverifiable operations stay on the reviewed path. */ }
     }
-    if (policy.kind === 'read' || policy.kind === 'interaction' || own || routine) {
+    let extra;
+    if (mode === 'adaptive' && policy.kind === 'review') {
+      try { extra = await extraReview(exec, cwd, [store.directory, PACKAGE_DIR]); }
+      catch { extra = '无法核对这次操作的影响。'; }
+    }
+    const delegated = mode === 'adaptive' && policy.kind === 'review' && !extra && !routine && hostAutoActive(ctx, exec.agent);
+    if (policy.kind === 'read' || policy.kind === 'interaction' || own || (routine && !extra) || delegated) {
       if (disposed || exec.signal?.aborted || cwd !== scopeOf(exec.agent)) return { kind: 'deny', reason: '检查期间操作已取消，或当前目录已改变。' };
       passed.set(exec.token, { scope: cwd, key: fingerprint(exec.name, exec.arguments),
+        ...(delegated ? { hostAuto: true } : {}),
         ...(routine === 'sandbox' ? { sandbox: ctx.get('sandboxPolicy').resolve({ session: exec.agent.session }) } : {}) });
-      return next();
+      return trackAsk(exec, await next());
     }
     const key = fingerprint(exec.name, exec.arguments);
     const entries = sessionPlans(exec.agent);
     const plan = entries.get(key);
     entries.delete(key); // An attempted use consumes the plan, including a rejection.
+    if (mode === 'adaptive') {
+      const bound = plan?.scope === cwd ? plan : undefined;
+      let summary = policy.label;
+      try { summary = validateChinese(exec.arguments.description, '操作说明', 120); } catch { /* Optional model text is not authority. */ }
+      const targets = resolvedPaths(exec.arguments, cwd);
+      const review = { key, tool: exec.name, args: exec.arguments, summary,
+        reason: extra ?? 'DSH 自动审查未开启或不可用。', impact: extra ?? policy.notice,
+        scope: cwd, ...bound, targets, policy };
+      recent.set(exec.agent.session, review);
+      passed.set(exec.token, { scope: cwd, key });
+      // Let the host merge its own ask/deny before creating a single approval.
+      const downstream = await next();
+      if (downstream.kind !== 'allow') return trackAsk(exec, downstream);
+      await store.audit(exec.name, 'review-requested');
+      const detail = [`操作：${review.summary}`,
+        ...(bound ? [`影响（模型说明）：${bound.impact}`] : []),
+        `注意：${extra ?? 'DSH 自动审查未开启或不可用，本次需要确认。'}`,
+        ...(targets.length ? [`位置：${targets.slice(0, 3).join('；')}${targets.length > 3 ? '（其余见详情）' : ''}`] : []),
+        '仅本次有效 · 详情：/guard-detail'].join('\n');
+      return trackAsk(exec, { kind: 'ask', reason: review.reason, displayReason: { zh: detail, en: detail } });
+    }
     if (!plan || plan.scope !== scopeOf(exec.agent)) return { kind: 'deny', reason: `尚未说明这一次操作，或参数、目录已改变。${exec.name === 'grep' && mode === 'balanced' ? '项目内容搜索请优先使用 guard_search，无须确认。' : ''}超出自动执行范围的操作，先用中文说明目的和影响，再调用 guard_plan 登记完全相同的参数。` };
     const targets = resolvedPaths(exec.arguments, plan.scope);
     if (targets.some(target => within(target, PACKAGE_DIR) || within(target, store.directory))) {
@@ -199,7 +251,7 @@ export async function install(ctx, config, defineTool) {
     if (disposed || exec.signal?.aborted || plan.scope !== scopeOf(exec.agent)) return { kind: 'deny', reason: '确认期间会话或目录已改变，请重新说明并确认。' };
     passed.set(exec.token, { scope: plan.scope, key });
     return next();
-  });
+  }, { prepend: true });
 
   // A later waterfall listener returning "allow" cannot undo this final denial.
   ctx.tools.guard(exec => {
@@ -207,6 +259,9 @@ export async function install(ctx, config, defineTool) {
     passed.delete(exec.token);
     if (permit && !disposed && !exec.signal?.aborted && permit.scope === scopeOf(exec.agent)
         && permit.key === fingerprint(exec.name, exec.arguments)) {
+      if (permit.approval && !permit.approval.granted) return '本次调用尚未取得 DSH 的单次批准，已阻止执行。';
+      if (permit.hostFullAccess && !hostFullAccessActive(ctx, exec.agent)) return '执行前 DSH 已退出完全权限，操作已停止。';
+      if (permit.hostAuto && !hostAutoActive(ctx, exec.agent)) return '执行前 DSH 自动审查已退出，操作已停止。';
       if (!permit.sandbox) return undefined;
       const current = ctx.get?.('sandboxPolicy')?.resolve({ session: exec.agent.session });
       if (ctx.get?.('shell')?.sandboxMode !== undefined && ['read-only', 'workspace-write'].includes(current?.mode)
@@ -225,7 +280,7 @@ export async function install(ctx, config, defineTool) {
     },
   });
   command('guard', '查看保护状态、使用说明和当前记忆。', async ({ agent }) =>
-    `记忆与操作保护正在运行，版本 0.2.1。\n\n${mode === 'balanced' ? '当前为日常模式：项目内普通读写和安全搜索直接执行；常规检查命令仅在宿主沙箱受限时自动执行。删除、清理、项目外修改和其他不确定操作仍需确认。' : '当前为严格模式：文件修改、脚本和未知工具逐次确认。'}\n\n中文说明按任务计划、关键进展和完成结果展示，不逐条打断常规操作。\n\n/guard-check：无副作用地验证实际工具拦截\n/remember 内容：保存到当前项目\n/remember global 内容：保存为全局记忆\n/forget 完整ID：停用记忆并保留历史\n/guard-detail：查看最近一次确认的完整技术详情\n/guard-history：查看最近的授权记录\n\n${memoryText(store.list(scopeOf(agent)))}`);
+    `记忆与操作保护正在运行，版本 0.3.1。\n\n${mode === 'adaptive' ? `当前为协作模式。${hostFullAccessActive(ctx, agent) ? '已尊重 DSH 完全权限：联网、命令、专家和项目外操作不再由插件登记或追加审批；敏感内容、插件自身与记忆存储保护保留。' : `${hostAutoActive(ctx, agent) ? 'DSH 自动审查已开启：常规命令、搜索和专家调用由宿主审查，不再逐条登记或额外提问。' : '当前未选择完全权限，也没有活跃的自动审查：项目内普通读写照常执行，其余操作交给 DSH 确认。'}明确的删除、清理、发布和项目外编辑仍需审批。`}` : mode === 'balanced' ? '当前为日常模式：项目内普通读写和安全搜索直接执行；常规检查命令仅在宿主沙箱受限时自动执行。删除、清理、项目外修改和其他不确定操作仍需确认。' : '当前为严格模式：文件修改、脚本和未知工具逐次确认。'}\n\n中文说明按任务计划、关键进展和完成结果展示，不逐条打断常规操作。\n\n/guard-check：无副作用地验证敏感路径拦截\n/remember 内容：保存到当前项目\n/remember global 内容：保存为全局记忆\n/forget 完整ID：停用记忆并保留历史\n/guard-detail：查看最近一次确认的完整技术详情\n/guard-history：查看最近的授权记录\n\n${memoryText(store.list(scopeOf(agent)))}`);
   command('guard-check', '用无副作用的模拟工具，检查未获授权的调用是否真的被拦住。', async ({ agent, signal }) => {
     if (typeof ctx.tools.modeFor === 'function' && ctx.tools.modeFor(agent) !== 'native') {
       throw new Error('当前不是 native 工具模式，无法进行这项自检。');
@@ -233,17 +288,18 @@ export async function install(ctx, config, defineTool) {
     const probeName = `guard_probe_${randomUUID().replaceAll('-', '')}`;
     let executions = 0;
     const unregister = ctx.tools.register(defineTool(toolString(probeName,
-      '安装验证用模拟工具，只返回固定文字，不执行命令或访问文件。', {},
+      '安装验证用模拟工具，只返回固定文字，不执行命令或访问文件。',
+      { path: { type: 'string', required: true, description: '只用于策略检查的模拟路径，不会打开文件。' } },
       async () => { executions += 1; return '无副作用的测试执行体'; })));
     try {
       if (!ctx.tools.get(probeName, agent)) throw new Error('模拟工具未能注册，自检未通过。');
-      const result = await ctx.tools.execute({ name: probeName, arguments: {}, agent,
+      const result = await ctx.tools.execute({ name: probeName, arguments: { path: '.env.guard-self-check' }, agent,
         callId: `guard-check-${randomUUID()}`, signal: signal ?? new AbortController().signal });
       const reason = result.content?.filter(item => item.type === 'text').map(item => item.text).join('\n') ?? '';
-      if (!result.isError || executions !== 0 || !/尚未说明这一次操作|未完成本插件的检查/u.test(reason)) {
+      if (!result.isError || executions !== 0 || !/参数涉及敏感文件|未完成本插件的检查/u.test(reason)) {
         throw new Error('没有取得本插件的明确拦截证据，自检未通过；请勿据此认为保护已经生效。');
       }
-      return '保护自检通过：模拟工具已注册；未获授权的调用被本插件拒绝；执行体运行 0 次。未运行系统命令，也未读写或删除任何文件。';
+      return '保护自检通过：敏感路径模拟调用被本插件拒绝；执行体运行 0 次。未运行系统命令，也未读写或删除任何文件。本项不验证自动审查模型的准确率。';
     } finally { unregister(); }
   });
   command('remember', '直接保存你明确输入的记忆；默认仅当前项目。', async ({ agent, rawInput }) => {
@@ -278,7 +334,7 @@ export async function install(ctx, config, defineTool) {
   });
   command('guard-history', '查看最近的授权结果，不记录完整命令或文件内容。', async () => {
     const items = store.events.filter(event => event.kind === 'audit').slice(-20);
-    return items.length ? items.map(event => `${event.time}  ${event.tool}  ${event.outcome === 'human-approved' ? '用户本次批准' : '未获批准'}`).join('\n') : '还没有授权记录。';
+    return items.length ? items.map(event => `${event.time}  ${event.tool}  ${event.outcome === 'human-approved' ? '用户本次批准' : event.outcome === 'review-requested' ? '已交 DSH 审批，结果见宿主记录' : '未获批准'}`).join('\n') : '还没有授权记录。';
   });
   return { store };
 }
